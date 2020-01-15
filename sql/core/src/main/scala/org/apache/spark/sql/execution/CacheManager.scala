@@ -25,12 +25,16 @@ import org.apache.hadoop.fs.{FileSystem, Path}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{Dataset, SparkSession}
-import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, ResolvedHint}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, AttributeSet, BinaryComparison, EqualTo, ExpressionSet, GreaterThanOrEqual, IsNotNull, LessThan, SubqueryExpression}
+import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, ResolvedHint}
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.types.StringType
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK
+import org.apache.spark.unsafe.types.UTF8String
 
 /** Holds a cached logical plan and its data */
 case class CachedData(plan: LogicalPlan, cachedRepresentation: InMemoryRelation)
@@ -192,6 +196,86 @@ class CacheManager extends Logging {
   /** Optionally returns cached data for the given [[LogicalPlan]]. */
   def lookupCachedData(plan: LogicalPlan): Option[CachedData] = readLock {
     cachedData.asScala.find(cd => plan.sameResult(cd.plan))
+  }
+
+  def customizedLookupCacheData(plan: LogicalPlan): LogicalPlan = readLock {
+    val cacheDatas = cachedData.asScala.filter(_.plan.isInstanceOf[Filter])
+    if (cacheDatas.isEmpty) {
+      return plan
+    }
+    cacheDatas.map { cd =>
+      plan match {
+        case filter@Filter(_, _) =>
+          try {
+            val (cacheFields, cacheFilters, cacheChild) = PhysicalOperation.unapply(cd.plan).get
+            val (fields, filters, child) = PhysicalOperation.unapply(plan).get
+
+            val set = AttributeSet(cacheFilters.head.asInstanceOf[BinaryComparison]
+              .left.children.head.asInstanceOf[AttributeReference].toAttribute)
+
+            val selectedFilters = ExpressionSet(filters
+              .filterNot(SubqueryExpression.hasSubquery)
+              .filter(_.references.subsetOf(set)))
+              .filterNot(_.isInstanceOf[IsNotNull]).toSeq
+
+            if (selectedFilters.exists(filter => !filter.isInstanceOf[EqualTo])) {
+              throw new RuntimeException
+            }
+
+            if (!selectedFilters.head.asInstanceOf[EqualTo]
+              .right.dataType.isInstanceOf[StringType]) {
+              throw new RuntimeException
+            }
+
+
+            var start = Long.MinValue
+            var end = Long.MaxValue
+            cacheFilters foreach {
+              case GreaterThanOrEqual(_, right) =>
+                start = right.eval(null).asInstanceOf[Long]
+              case LessThan(_, right) =>
+                end = right.eval(null).asInstanceOf[Long]
+              case _ =>
+            }
+
+            var point = 0L
+            selectedFilters foreach {
+              case EqualTo(_, right) =>
+                val timeZoneId = SparkSession.getActiveSession.get
+                  .sessionState.conf.sessionLocalTimeZone
+                point = DateTimeUtils.stringToTimestamp(
+                  right.eval(null).asInstanceOf[UTF8String],
+                  DateTimeUtils.getTimeZone(timeZoneId)).get
+            }
+
+            if (fields.equals(cacheFields) &&
+              point < end && point >= start &&
+              child.sameResult(cacheChild)) {
+              filter.copy(child = cd.cachedRepresentation.withOutput(filter.output))
+            } else {
+              filter
+            }
+          } catch {
+            case e: Throwable =>
+              logError("Match cache failed.", e)
+              filter
+          }
+        case _ => plan
+      }
+    }.head
+  }
+
+  def useCustomizedCachedData(plan: LogicalPlan): LogicalPlan = {
+    val newPlan = plan transformDown {
+      case hint: ResolvedHint => hint
+
+      case currentFragment =>
+        customizedLookupCacheData(currentFragment)
+    }
+
+    newPlan transformAllExpressions {
+      case s: SubqueryExpression => s.withNewPlan(useCustomizedCachedData(s.plan))
+    }
   }
 
   /** Replaces segments of the given logical plan with cached versions where possible. */

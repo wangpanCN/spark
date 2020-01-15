@@ -65,11 +65,22 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
 
   lazy val optimizedPlan: LogicalPlan = sparkSession.sessionState.optimizer.execute(withCachedData)
 
+  lazy val withCustomizedCacheData: LogicalPlan = {
+    sparkSession.sharedState.cacheManager.useCustomizedCachedData(optimizedPlan)
+  }
+
   lazy val sparkPlan: SparkPlan = {
     SparkSession.setActiveSession(sparkSession)
     // TODO: We use next(), i.e. take the first plan returned by the planner, here for now,
     //       but we will implement to choose the best plan.
-    planner.plan(ReturnAnswer(optimizedPlan)).next()
+    planner.plan(
+      if (sparkSession.sparkContext
+        .conf.getBoolean("spark.cache.use-customized-match", defaultValue = false)) {
+        ReturnAnswer(withCustomizedCacheData)
+      } else {
+        ReturnAnswer(optimizedPlan)
+      }
+    ).next()
   }
 
   // executedPlan should not be used to initialize any SparkPlan. It should be
