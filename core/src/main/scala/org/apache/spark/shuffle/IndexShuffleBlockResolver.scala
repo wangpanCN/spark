@@ -184,6 +184,9 @@ private[spark] class IndexShuffleBlockResolver(
         }
       }
     } finally {
+      if (indexFile.exists()) {
+        logInfo(s"Index file ${indexFile.getAbsolutePath} exists")
+      }
       if (indexTmp.exists() && !indexTmp.delete()) {
         logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
       }
